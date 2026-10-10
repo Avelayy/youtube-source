@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Arrays;
@@ -25,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,8 +43,10 @@ import java.util.TreeMap;
  * reconstruct a continuous (fragmented MP4 or WebM) byte stream that Lavaplayer's container readers
  * can consume.</p>
  *
- * <p>The reconstructed bytes are retained in memory so that arbitrary (including backwards) seeks are
- * supported without re-downloading. For audio this is a few megabytes at most.</p>
+ * <p>The reconstructed bytes are kept in memory so that nearby (including small backwards) seeks are
+ * satisfied without re-downloading. Memory is bounded: the initialization segment is always kept,
+ * but media further than {@link #MAX_RETAINED_BEHIND_BYTES} behind the read position is evicted.
+ * A seek into evicted media simply re-aims the SABR timeline.</p>
  */
 public class SabrStream extends SeekableInputStream {
     private static final Logger log = LoggerFactory.getLogger(SabrStream.class);
@@ -68,6 +72,16 @@ public class SabrStream extends SeekableInputStream {
     private static final int ENABLED_TRACK_TYPES_AUDIO_ONLY = 1;
     // A hard cap to guard against pathological request loops that never make progress.
     private static final int MAX_REQUESTS = 10000;
+    // Already-played media further than this behind readPos is evicted (init segment is kept), so
+    // memory stays bounded for hour-long tracks instead of growing with playback time.
+    private static final long MAX_RETAINED_BEHIND_BYTES = 4L * 1024L * 1024L;
+    // Pause between retries of a failed request, multiplied by the attempt number.
+    private static final long RETRY_DELAY_MS = 200L;
+    // A response without media is not necessarily the end of the stream (the server may only send
+    // a policy asking us to back off), so allow a few of them before giving up.
+    private static final int MAX_CONSECUTIVE_EMPTY_RESPONSES = 3;
+    private static final long EMPTY_RESPONSE_DELAY_MS = 250L;
+    private static final long MAX_BACKOFF_MS = 10_000L;
 
     private final HttpInterface httpInterface;
     private final byte[] ustreamerConfig;
@@ -85,6 +99,13 @@ public class SabrStream extends SeekableInputStream {
     private int requestNumber;
     private int requestCount;
 
+    // Bookkeeping for the init segment, eviction and empty-response handling.
+    private long initSegmentLength;
+    private long evictedBefore;
+    private long storedSegmentCount;
+    private int consecutiveEmptyResponses;
+    private long policyBackoffMs;
+
     private long durationMs;
     private long downloadedDurationMs;
 
@@ -92,6 +113,8 @@ public class SabrStream extends SeekableInputStream {
     // For a forward hard seek, estimate the target playback time from the known file length and
     // place the returned media at the byte offset requested by the container reader.
     private long writePos;
+    // Byte offset where the most recent fast seek (re-aim) placed its media, or -1.
+    private long lastFastSeekStart = -1L;
     private boolean fastSeekActive;
     private long pendingExactSeekTimeMs = -1L;
 
@@ -174,13 +197,20 @@ public class SabrStream extends SeekableInputStream {
         // requested Matroska byte offset is inside a sufficiently large *contiguous* cached
         // neighbourhood. This is deliberately stronger than hasByte(position): V5 showed that a
         // sparse single-byte/cache hit can strand MatroskaFileReader.skip() at the next hole.
+        //
+        // One extra case is safe: seeking to the very byte where the last re-aim started. The parser
+        // already consumed exactly that entry point (nothing before it, by construction) a moment
+        // ago, so having no bytes behind it is the known-good state, not a hole. This is what
+        // happens when two nearby time seeks resolve to the same cue/cluster.
+        boolean atFreshWindowStart = position == lastFastSeekStart;
         if (exactTimeMs >= 0
             && cachedAhead >= LOCAL_SEEK_MIN_CONTIGUOUS_BYTES
-            && cachedBehind >= LOCAL_SEEK_MIN_BACKTRACK_BYTES) {
+            && (cachedBehind >= LOCAL_SEEK_MIN_BACKTRACK_BYTES || atFreshWindowStart)) {
             pendingExactSeekTimeMs = -1L;
             readPos = position;
-            log.debug("SABR local cached seek: {}ms at byte {} ({} bytes behind, {} bytes ahead)",
-                exactTimeMs, position, cachedBehind, cachedAhead);
+            log.debug("SABR local cached seek: {}ms at byte {} ({} bytes behind, {} bytes ahead{})",
+                exactTimeMs, position, cachedBehind, cachedAhead,
+                atFreshWindowStart && cachedBehind < LOCAL_SEEK_MIN_BACKTRACK_BYTES ? ", start of last re-aim" : "");
             return;
         }
 
@@ -201,6 +231,13 @@ public class SabrStream extends SeekableInputStream {
                 readPos = position;
                 return;
             }
+        }
+
+        if (position < evictedBefore) {
+            // The bytes were evicted and we could not re-aim SABR; waiting for them would just
+            // download the rest of the stream, so fail the seek explicitly.
+            throw new IOException("Seek to byte " + position + " is behind the retained SABR window ("
+                + evictedBefore + ") and cannot be re-aimed");
         }
 
         fastSeekActive = false;
@@ -228,9 +265,15 @@ public class SabrStream extends SeekableInputStream {
 
         downloadedDurationMs = requestTimeMs;
         writePos = position;
+        lastFastSeekStart = position;
         // Never mix stale bytes from an older sparse neighbourhood with a newly fetched cluster.
         // Overlapping old chunks were a source of invalid EBML boundaries after backwards seeks.
         buffer.truncateFrom(position);
+        if (position < initSegmentLength) {
+            // The init segment was (partly) cut off; accept it again if the server re-sends it.
+            initSegmentLength = 0L;
+        }
+        consecutiveEmptyResponses = 0;
         fastSeekActive = true;
         finished = false;
 
@@ -344,6 +387,9 @@ public class SabrStream extends SeekableInputStream {
         pendingExactSeekTimeMs = -1L;
         readPos = 0L;
         writePos = 0L;
+        initSegmentLength = 0L;
+        evictedBefore = 0L;
+        lastFastSeekStart = -1L;
         fastSeekActive = false;
         finished = true;
 
@@ -361,10 +407,27 @@ public class SabrStream extends SeekableInputStream {
         long wanted = Math.max(0, target - 1);
 
         while (!finished && !buffer.hasByte(wanted)) {
+            evictPlayedMedia();
             fetchNextBatch();
         }
 
         return buffer.hasByte(readPos);
+    }
+
+    /**
+     * Drops media far behind the read position. Only called from the read path (where readPos is
+     * authoritative) and just before downloading more, so memory is bounded by the window.
+     */
+    private void evictPlayedMedia() {
+        long keepFrom = readPos - MAX_RETAINED_BEHIND_BYTES;
+        if (keepFrom <= initSegmentLength) {
+            return;
+        }
+
+        long evictedEnd = buffer.evictBefore(keepFrom, initSegmentLength);
+        if (evictedEnd > 0) {
+            evictedBefore = Math.max(evictedBefore, evictedEnd);
+        }
     }
 
     private void ensureContiguousWindow(long position, long minimumBytes) throws IOException {
@@ -385,17 +448,39 @@ public class SabrStream extends SeekableInputStream {
             return;
         }
 
-        long bytesBefore = buffer.length();
+        long storedBefore = storedSegmentCount;
         long durationBefore = downloadedDurationMs;
         boolean redirected = executeRequestWithRetry();
 
-        if (!redirected && buffer.length() == bytesBefore && downloadedDurationMs == durationBefore) {
-            // No progress was made and we weren't redirected; assume the stream has ended.
+        boolean progress = redirected
+            || storedSegmentCount != storedBefore
+            || downloadedDurationMs != durationBefore;
+
+        if (progress) {
+            consecutiveEmptyResponses = 0;
+        } else if (++consecutiveEmptyResponses >= MAX_CONSECUTIVE_EMPTY_RESPONSES) {
+            // Repeated responses without media: assume the stream has really ended.
             finished = true;
+        } else {
+            // The server may only have sent a policy asking us to wait; honour it before asking again.
+            long delay = policyBackoffMs > 0 ? policyBackoffMs : EMPTY_RESPONSE_DELAY_MS;
+            sleepInterruptibly(Math.min(delay, MAX_BACKOFF_MS));
         }
 
         if (downloadedDurationMs >= durationMs) {
             finished = true;
+        }
+    }
+
+    private static void sleepInterruptibly(long millis) throws IOException {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            InterruptedIOException interrupted = new InterruptedIOException("Interrupted while waiting for SABR request");
+            // Lavaplayer looks for an InterruptedException cause to tell "track stopped" from a failure.
+            interrupted.initCause(e);
+            throw interrupted;
         }
     }
 
@@ -411,6 +496,10 @@ public class SabrStream extends SeekableInputStream {
                 lastError = e;
                 log.debug("SABR request attempt {} failed: {}", attempt + 1, e.getMessage());
             }
+
+            if (attempt < MAX_REQUEST_RETRIES) {
+                sleepInterruptibly(RETRY_DELAY_MS * (attempt + 1));
+            }
         }
 
         throw lastError != null ? lastError : new IOException("SABR request failed");
@@ -423,6 +512,7 @@ public class SabrStream extends SeekableInputStream {
      */
     private boolean executeRequest() throws IOException {
         partialSegmentQueue.clear();
+        policyBackoffMs = 0L;
         requestCount++;
 
         if (cachedBufferedRanges == null) {
@@ -544,11 +634,18 @@ public class SabrStream extends SeekableInputStream {
         ProtoReader reader = new ProtoReader(data);
         int tag;
         while ((tag = reader.readTag()) != -1) {
-            if (reader.getFieldNumber() == 7) {
-                // playback_cookie, stored as raw bytes to echo back in the next request.
-                playbackCookie = reader.readBytes();
-            } else {
-                reader.skip();
+            switch (reader.getFieldNumber()) {
+                case 4:
+                    // backoff_time_ms: only honoured when a response carried no media.
+                    policyBackoffMs = reader.readVarint();
+                    break;
+                case 7:
+                    // playback_cookie, stored as raw bytes to echo back in the next request.
+                    playbackCookie = reader.readBytes();
+                    break;
+                default:
+                    reader.skip();
+                    break;
             }
         }
     }
@@ -725,13 +822,26 @@ public class SabrStream extends SeekableInputStream {
             return;
         }
 
-        if (fastSeekActive) {
+        if (segment.header.isInitSeg) {
+            if (initSegmentLength > 0) {
+                // The init segment is already at the start of the buffer. Writing it again at
+                // writePos (e.g. after a re-aim) would corrupt the container stream.
+                log.debug("Dropping duplicate SABR init segment ({} bytes)", segmentBytes.length);
+                return;
+            }
+            buffer.put(0L, segmentBytes);
+            initSegmentLength = segmentBytes.length;
+            if (!fastSeekActive) {
+                writePos = buffer.length();
+            }
+        } else if (fastSeekActive) {
             buffer.put(writePos, segmentBytes);
             writePos += segmentBytes.length;
         } else {
             buffer.append(segmentBytes);
             writePos = buffer.length();
         }
+        storedSegmentCount++;
         downloadedSegments.add(segment.segmentNumber);
         downloadedDurationMs += segment.header.effectiveDurationMs();
         lastMediaHeaders.add(segment.header);
@@ -990,6 +1100,29 @@ public class SabrStream extends SeekableInputStream {
                 end = Math.max(end, entry.getKey() + entry.getValue().length);
             }
             return end;
+        }
+
+        /**
+         * Removes whole chunks that end at or before {@code position}, except chunks starting
+         * below {@code protectedPrefix} (the init segment).
+         *
+         * @return the highest end offset of a removed chunk, or 0 if nothing was removed.
+         */
+        long evictBefore(long position, long protectedPrefix) {
+            long highestEnd = 0L;
+            Iterator<Map.Entry<Long, byte[]>> it =
+                chunks.subMap(Math.max(0L, protectedPrefix), true, position, false).entrySet().iterator();
+
+            while (it.hasNext()) {
+                Map.Entry<Long, byte[]> entry = it.next();
+                long end = entry.getKey() + entry.getValue().length;
+                if (end > position) {
+                    break;
+                }
+                highestEnd = Math.max(highestEnd, end);
+                it.remove();
+            }
+            return highestEnd;
         }
 
         void truncateFrom(long position) {
