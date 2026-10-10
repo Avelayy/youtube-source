@@ -225,9 +225,9 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     try (SabrStream stream = new SabrStream(httpInterface, resolvedUrl, ustreamerBytes, poTokenBytes,
         clientInfo, formatId, format.isDrc(), format.getContentLength(), trackInfo.length)) {
       if (format.getType().getMimeType().endsWith("/webm")) {
-        processDelegate(new MatroskaAudioTrack(trackInfo, stream), localExecutor);
+        processDelegate(new dev.lavalink.youtube.sabr.SabrMatroskaAudioTrack(trackInfo, stream), localExecutor);
       } else {
-        processDelegate(new MpegAudioTrack(trackInfo, stream), localExecutor);
+        processDelegate(new dev.lavalink.youtube.sabr.SabrMpegAudioTrack(trackInfo, stream), localExecutor);
       }
     }
   }

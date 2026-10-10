@@ -20,6 +20,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -27,6 +28,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 
 /**
  * A {@link SeekableInputStream} that plays a YouTube SABR (Server Adaptive Bitrate) audio stream.
@@ -45,6 +48,22 @@ public class SabrStream extends SeekableInputStream {
     private static final Logger log = LoggerFactory.getLogger(SabrStream.class);
 
     private static final long MAX_SKIP_DISTANCE = 512L * 1024L;
+    // Small forward jumps are cheaper and safer to satisfy from the normal sequential SABR flow.
+    private static final long FAST_SEEK_MIN_GAP = 2L * 1024L * 1024L;
+    // Keep some media after the requested point available so container readers can inspect
+    // clusters/cues without immediately hitting the logical end of the SABR session.
+    private static final long FAST_SEEK_END_MARGIN_MS = 30_000L;
+    // Fetch SABR media before the exact requested time. Matroska seeks to the cue/cluster before
+    // the requested timestamp and then discards frames until minimumTimecode. Fetching exactly at
+    // the user timestamp can therefore place a later cluster at an earlier cue byte offset.
+    private static final long EXACT_SEEK_PREROLL_MS = 0L;
+    private static final long SEEK_PREFETCH_BYTES = 1024L * 1024L;
+    // A cached seek is safe only when the target byte belongs to a genuinely contiguous
+    // neighbourhood. A single cached byte is not enough for Matroska to continue parsing.
+    private static final long LOCAL_SEEK_MIN_CONTIGUOUS_BYTES = 512L * 1024L;
+    // Require some valid bytes immediately before the cue as well. Matroska may walk backwards
+    // around cue/cluster boundaries while resolving a time seek.
+    private static final long LOCAL_SEEK_MIN_BACKTRACK_BYTES = 128L * 1024L;
     private static final int MAX_REQUEST_RETRIES = 3;
     private static final int ENABLED_TRACK_TYPES_AUDIO_ONLY = 1;
     // A hard cap to guard against pathological request loops that never make progress.
@@ -56,6 +75,7 @@ public class SabrStream extends SeekableInputStream {
     private final SabrClientInfo clientInfo;
     private final FormatId audioFormatId;
     private final boolean drcEnabled;
+    private final long contentLength;
 
     private final ChunkedByteBuffer buffer = new ChunkedByteBuffer();
 
@@ -67,6 +87,13 @@ public class SabrStream extends SeekableInputStream {
 
     private long durationMs;
     private long downloadedDurationMs;
+
+    // Fast-seek state. SABR requests are time based while Lavaplayer seeks by byte offset.
+    // For a forward hard seek, estimate the target playback time from the known file length and
+    // place the returned media at the byte offset requested by the container reader.
+    private long writePos;
+    private boolean fastSeekActive;
+    private long pendingExactSeekTimeMs = -1L;
 
     // Per-stream SABR state.
     private boolean formatInitialized;
@@ -100,6 +127,7 @@ public class SabrStream extends SeekableInputStream {
         this.clientInfo = clientInfo;
         this.audioFormatId = audioFormatId;
         this.drcEnabled = drcEnabled;
+        this.contentLength = contentLength;
         this.durationMs = durationMs > 0 ? durationMs : Long.MAX_VALUE;
     }
 
@@ -109,10 +137,132 @@ public class SabrStream extends SeekableInputStream {
         return readPos;
     }
 
+    /**
+     * Supplies the exact user-requested playback time for the next hard seek performed by the
+     * container parser. This avoids estimating a timestamp from a WebM/MP4 byte offset.
+     */
+    public void prepareTimeSeek(long timeMs) {
+        long upperBound = durationMs == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, durationMs - 1L);
+        pendingExactSeekTimeMs = Math.min(Math.max(0L, timeMs), upperBound);
+        log.debug("SABR exact time seek prepared: {}ms", pendingExactSeekTimeMs);
+    }
+
+    /**
+     * Ends the short exact-seek scope opened by prepareTimeSeek(). Some container seeks are
+     * satisfied entirely from their own indexes and never call seekHard(). V7 left the timestamp
+     * armed in that case, so a later parser/internal hard seek could accidentally re-aim SABR to
+     * an old user position.
+     */
+    public void finishTimeSeek() {
+        if (pendingExactSeekTimeMs >= 0) {
+            log.debug("SABR exact time seek completed without hard seek: {}ms", pendingExactSeekTimeMs);
+            pendingExactSeekTimeMs = -1L;
+        }
+    }
+
     @Override
     protected void seekHard(long position) throws IOException {
-        ensureAvailable(position);
-        readPos = Math.min(position, buffer.length());
+        if (position < 0) {
+            position = 0;
+        }
+
+        long exactTimeMs = pendingExactSeekTimeMs;
+        long cachedAhead = buffer.contiguousAvailable(position);
+        long cachedBehind = buffer.contiguousBefore(position);
+
+        // V7 hybrid seek: an explicit time seek may stay completely local, but only when the
+        // requested Matroska byte offset is inside a sufficiently large *contiguous* cached
+        // neighbourhood. This is deliberately stronger than hasByte(position): V5 showed that a
+        // sparse single-byte/cache hit can strand MatroskaFileReader.skip() at the next hole.
+        if (exactTimeMs >= 0
+            && cachedAhead >= LOCAL_SEEK_MIN_CONTIGUOUS_BYTES
+            && cachedBehind >= LOCAL_SEEK_MIN_BACKTRACK_BYTES) {
+            pendingExactSeekTimeMs = -1L;
+            readPos = position;
+            log.debug("SABR local cached seek: {}ms at byte {} ({} bytes behind, {} bytes ahead)",
+                exactTimeMs, position, cachedBehind, cachedAhead);
+            return;
+        }
+
+        // Non-user/container-internal seeks may still reuse any cached byte. They are part of the
+        // parser's normal navigation and must not accidentally re-aim the remote SABR timeline.
+        if (exactTimeMs < 0 && buffer.hasByte(position)) {
+            readPos = position;
+            return;
+        }
+
+        // Explicit seeks which are not safely cached always re-aim SABR with the exact timestamp.
+        // Large non-explicit hard seeks retain the byte->time fallback used by the experimental
+        // implementation.
+        if (exactTimeMs >= 0 || canFastSeek(position)) {
+            beginFastSeek(position, "hard-seek");
+            ensureContiguousWindow(position, SEEK_PREFETCH_BYTES);
+            if (buffer.hasByte(position)) {
+                readPos = position;
+                return;
+            }
+        }
+
+        fastSeekActive = false;
+        writePos = buffer.contiguousPrefixLength();
+        ensureAvailable(position + 1);
+        readPos = buffer.hasByte(position) ? position : Math.min(position, buffer.contiguousPrefixLength());
+    }
+
+    private void beginFastSeek(long position, @NotNull String reason) {
+        long exactTimeMs = pendingExactSeekTimeMs;
+        pendingExactSeekTimeMs = -1L;
+        // For an exact user seek, use the exact requested playback timestamp. Do not subtract a
+        // fixed preroll: placing media fetched from an earlier timestamp at the byte offset chosen
+        // for the target cue can misalign the logical Matroska stream. The container itself handles
+        // frame filtering around its selected cue point.
+        long requestTimeMs = exactTimeMs >= 0
+            ? Math.max(0L, exactTimeMs - EXACT_SEEK_PREROLL_MS)
+            : estimateTimeForBytePosition(position);
+
+        log.debug("SABR fast seek ({}): byte {} -> request {}ms, target {}ms{} " +
+                "(read {}, buffered max {}, downloaded time {}ms)",
+            reason, position, requestTimeMs, exactTimeMs >= 0 ? exactTimeMs : requestTimeMs,
+            exactTimeMs >= 0 ? " exact" : " estimated",
+            readPos, buffer.length(), downloadedDurationMs);
+
+        downloadedDurationMs = requestTimeMs;
+        writePos = position;
+        // Never mix stale bytes from an older sparse neighbourhood with a newly fetched cluster.
+        // Overlapping old chunks were a source of invalid EBML boundaries after backwards seeks.
+        buffer.truncateFrom(position);
+        fastSeekActive = true;
+        finished = false;
+
+        // Segment numbers are local to the requested SABR neighbourhood. Keeping the de-duplication
+        // set across a backwards re-aim can cause valid returned segments to be discarded, leaving
+        // the Matroska reader at a sparse boundary and eventually producing EOFException.
+        downloadedSegments.clear();
+        cachedBufferedRanges = Collections.emptyList();
+        lastMediaHeaders.clear();
+        partialSegmentQueue.clear();
+    }
+
+    private boolean canFastSeek(long position) {
+        if (contentLength <= 0 || durationMs <= 0 || durationMs == Long.MAX_VALUE) {
+            return false;
+        }
+        if (buffer.hasByte(position)) {
+            return false;
+        }
+
+        long distance = position >= readPos ? position - readPos : readPos - position;
+        // Explicit exact seeks are handled by seekHard() before this method is called. This method
+        // is therefore only the fallback for large container/internal hard seeks.
+        return distance >= FAST_SEEK_MIN_GAP;
+    }
+
+    private long estimateTimeForBytePosition(long position) {
+        double fraction = Math.min(1.0d, Math.max(0.0d, (double) position / (double) contentLength));
+        long estimated = (long) (fraction * durationMs);
+        long target = Math.max(0L, estimated - 1500L);
+        long latestSafeStart = Math.max(0L, durationMs - FAST_SEEK_END_MARGIN_MS);
+        return Math.min(target, latestSafeStart);
     }
 
     @Override
@@ -146,7 +296,11 @@ public class SabrStream extends SeekableInputStream {
             return -1;
         }
 
-        int available = (int) Math.min(len, buffer.length() - readPos);
+        int available = (int) Math.min((long) len, buffer.contiguousAvailable(readPos));
+        if (available <= 0) {
+            return -1;
+        }
+
         buffer.copyTo(readPos, b, off, available);
         readPos += available;
         return available;
@@ -162,14 +316,38 @@ public class SabrStream extends SeekableInputStream {
             return 0;
         }
 
-        long skipped = Math.min(n, buffer.length() - readPos);
+        long skipped = Math.min(n, buffer.contiguousAvailable(readPos));
         readPos += skipped;
         return skipped;
     }
 
+    private boolean closed;
+
     @Override
     public void close() {
-        // Nothing to release; the HTTP interface lifecycle is owned by the caller.
+        if (closed) {
+            return;
+        }
+        closed = true;
+        // The SABR cache belongs to this track only. Drop all retained media and per-stream
+        // bookkeeping as soon as Lavaplayer closes the track so the JVM can reclaim the RAM
+        // before/while the next track starts. The HttpInterface lifecycle is still owned by
+        // the caller and must not be closed here.
+        buffer.clear();
+        downloadedSegments.clear();
+        lastMediaHeaders.clear();
+        partialSegmentQueue.clear();
+        sabrContextValues.clear();
+        activeSabrContextTypes.clear();
+        cachedBufferedRanges = null;
+        playbackCookie = null;
+        pendingExactSeekTimeMs = -1L;
+        readPos = 0L;
+        writePos = 0L;
+        fastSeekActive = false;
+        finished = true;
+
+        log.debug("SABR stream closed; per-track media cache released");
     }
     //</editor-fold>
 
@@ -180,11 +358,25 @@ public class SabrStream extends SeekableInputStream {
      * @return {@code true} if a byte is available at the current read position.
      */
     private boolean ensureAvailable(long target) throws IOException {
-        while (!finished && buffer.length() < target) {
+        long wanted = Math.max(0, target - 1);
+
+        while (!finished && !buffer.hasByte(wanted)) {
             fetchNextBatch();
         }
 
-        return readPos < buffer.length();
+        return buffer.hasByte(readPos);
+    }
+
+    private void ensureContiguousWindow(long position, long minimumBytes) throws IOException {
+        long target = Math.max(1L, minimumBytes);
+        while (!finished && buffer.contiguousAvailable(position) < target) {
+            long before = buffer.contiguousAvailable(position);
+            fetchNextBatch();
+            long after = buffer.contiguousAvailable(position);
+            if (after <= before && finished) {
+                break;
+            }
+        }
     }
 
     private void fetchNextBatch() throws IOException {
@@ -533,7 +725,13 @@ public class SabrStream extends SeekableInputStream {
             return;
         }
 
-        buffer.append(segmentBytes);
+        if (fastSeekActive) {
+            buffer.put(writePos, segmentBytes);
+            writePos += segmentBytes.length;
+        } else {
+            buffer.append(segmentBytes);
+            writePos = buffer.length();
+        }
         downloadedSegments.add(segment.segmentNumber);
         downloadedDurationMs += segment.header.effectiveDurationMs();
         lastMediaHeaders.add(segment.header);
@@ -705,52 +903,150 @@ public class SabrStream extends SeekableInputStream {
      * repeated full-array reallocation of a single backing array as the stream grows.
      */
     private static class ChunkedByteBuffer {
-        private final List<byte[]> chunks = new ArrayList<>();
+        // Chunks are keyed by their absolute byte offset. This allows a forward SABR seek to cache
+        // media around the requested position without downloading the entire gap first.
+        private final NavigableMap<Long, byte[]> chunks = new TreeMap<>();
         private long length;
 
         void append(@NotNull byte[] chunk) {
+            put(length, chunk);
+        }
+
+        void put(long position, @NotNull byte[] chunk) {
             if (chunk.length == 0) {
                 return;
             }
-
-            chunks.add(chunk);
-            length += chunk.length;
+            chunks.put(position, chunk);
+            length = Math.max(length, position + chunk.length);
         }
 
         long length() {
             return length;
         }
 
-        byte get(long position) {
-            long remaining = position;
-            for (byte[] chunk : chunks) {
-                if (remaining < chunk.length) {
-                    return chunk[(int) remaining];
-                }
-                remaining -= chunk.length;
+        void clear() {
+            chunks.clear();
+            length = 0L;
+        }
+
+        boolean hasByte(long position) {
+            if (position < 0) {
+                return false;
             }
-            throw new IndexOutOfBoundsException("Position " + position + " out of bounds (length " + length + ")");
+            Map.Entry<Long, byte[]> entry = chunks.floorEntry(position);
+            return entry != null && position - entry.getKey() < entry.getValue().length;
+        }
+
+        long contiguousAvailable(long position) {
+            if (position < 0) {
+                return 0;
+            }
+
+            Map.Entry<Long, byte[]> entry = chunks.floorEntry(position);
+            if (entry == null || position - entry.getKey() >= entry.getValue().length) {
+                return 0;
+            }
+
+            long end = entry.getKey() + entry.getValue().length;
+            Map.Entry<Long, byte[]> next = chunks.higherEntry(entry.getKey());
+            while (next != null && next.getKey() <= end) {
+                end = Math.max(end, next.getKey() + next.getValue().length);
+                next = chunks.higherEntry(next.getKey());
+            }
+            return Math.max(0, end - position);
+        }
+
+        long contiguousBefore(long position) {
+            if (position <= 0) {
+                return position == 0 && hasByte(0) ? 0 : 0;
+            }
+
+            Map.Entry<Long, byte[]> entry = chunks.floorEntry(position - 1);
+            if (entry == null || position - 1 >= entry.getKey() + entry.getValue().length) {
+                return 0;
+            }
+
+            long start = entry.getKey();
+            long cursor = start;
+            Map.Entry<Long, byte[]> previous = chunks.lowerEntry(entry.getKey());
+            while (previous != null) {
+                long previousEnd = previous.getKey() + previous.getValue().length;
+                if (previousEnd < cursor) {
+                    break;
+                }
+                start = previous.getKey();
+                cursor = start;
+                previous = chunks.lowerEntry(previous.getKey());
+            }
+            return Math.max(0L, position - start);
+        }
+
+        long contiguousPrefixLength() {
+            long end = 0;
+            for (Map.Entry<Long, byte[]> entry : chunks.entrySet()) {
+                if (entry.getKey() > end) {
+                    break;
+                }
+                end = Math.max(end, entry.getKey() + entry.getValue().length);
+            }
+            return end;
+        }
+
+        void truncateFrom(long position) {
+            if (position < 0) {
+                position = 0;
+            }
+
+            Map.Entry<Long, byte[]> overlap = chunks.floorEntry(position);
+            if (overlap != null) {
+                long start = overlap.getKey();
+                byte[] data = overlap.getValue();
+                long end = start + data.length;
+                if (start < position && end > position) {
+                    int keep = (int) (position - start);
+                    if (keep > 0) {
+                        chunks.put(start, Arrays.copyOf(data, keep));
+                    } else {
+                        chunks.remove(start);
+                    }
+                }
+            }
+
+            chunks.tailMap(position, true).clear();
+            length = 0;
+            for (Map.Entry<Long, byte[]> entry : chunks.entrySet()) {
+                length = Math.max(length, entry.getKey() + entry.getValue().length);
+            }
+        }
+
+        byte get(long position) {
+            Map.Entry<Long, byte[]> entry = chunks.floorEntry(position);
+            if (entry == null || position - entry.getKey() >= entry.getValue().length) {
+                throw new IndexOutOfBoundsException("Position " + position + " is not buffered");
+            }
+            return entry.getValue()[(int) (position - entry.getKey())];
         }
 
         void copyTo(long position, @NotNull byte[] dest, int destOffset, int count) {
-            long remaining = position;
             int written = 0;
+            long cursor = position;
 
-            for (byte[] chunk : chunks) {
-                if (written >= count) {
+            while (written < count) {
+                Map.Entry<Long, byte[]> entry = chunks.floorEntry(cursor);
+                if (entry == null || cursor - entry.getKey() >= entry.getValue().length) {
                     break;
                 }
 
-                if (remaining >= chunk.length) {
-                    remaining -= chunk.length;
-                    continue;
-                }
-
-                int chunkOffset = (int) remaining;
+                byte[] chunk = entry.getValue();
+                int chunkOffset = (int) (cursor - entry.getKey());
                 int toCopy = Math.min(count - written, chunk.length - chunkOffset);
                 System.arraycopy(chunk, chunkOffset, dest, destOffset + written, toCopy);
                 written += toCopy;
-                remaining = 0;
+                cursor += toCopy;
+
+                if (written < count && !hasByte(cursor)) {
+                    break;
+                }
             }
         }
     }
